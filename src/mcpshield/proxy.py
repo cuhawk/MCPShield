@@ -3,6 +3,7 @@
 import asyncio
 import json
 import os
+import re
 import sys
 
 import httpx
@@ -14,6 +15,7 @@ from .taint import SessionTaint
 from .telemetry import Audit
 
 MAX_MESSAGE = 1024 * 1024
+SSE_BOUNDARY = re.compile(rb"(?:\r\n|\n)(?:\r\n|\n)")
 METHODS = {"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"}
 
 
@@ -60,6 +62,7 @@ class Proxy:
                     arguments = params.get("arguments", {})
                     rule, attenuated = self.policy.authorize(name, arguments, scopes)
                     self.taint.check_call(arguments, rule.tier)
+                    params = {"name": name, "arguments": arguments}
                 outbound = {"jsonrpc": "2.0", "method": method, "params": params}
                 if not notification:
                     outbound["id"] = request_id
@@ -67,7 +70,10 @@ class Proxy:
                 reply = await asyncio.wait_for(self.upstream(outbound, attenuated), 30)
                 if notification:
                     return None
-                if not isinstance(reply, dict) or reply.get("id") != request_id:
+                if (not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0"
+                        or "id" not in reply or type(reply["id"]) is not type(request_id)
+                        or reply["id"] != request_id
+                        or ("result" in reply) == ("error" in reply)):
                     raise UpstreamError
                 if method == "tools/list" and isinstance(reply.get("result"), dict):
                     result = reply["result"]
@@ -111,12 +117,12 @@ class HTTPUpstream:
                 body = bytearray()
                 sse = "text/event-stream" in reply.headers.get("content-type", "")
                 async for chunk in reply.aiter_bytes():
-                    body.extend(chunk.replace(b"\r\n", b"\n") if sse else chunk)
+                    body.extend(chunk)
                     if len(body) > MAX_MESSAGE:
                         raise UpstreamError
-                    while sse and b"\n\n" in body:
-                        frame, _, remainder = body.partition(b"\n\n")
-                        body = bytearray(remainder)
+                    while sse and (end := SSE_BOUNDARY.search(body)):
+                        frame = body[:end.start()]
+                        body = body[end.end():]
                         data = b"\n".join(line[5:].lstrip(b" ") for line in frame.splitlines()
                                           if line.startswith(b"data:"))
                         if data:
