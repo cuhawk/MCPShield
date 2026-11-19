@@ -34,11 +34,13 @@ tools:
 Run `mcpshield check policy.yml` to validate configuration and
 `mcpshield proxy policy.yml --scope search --upstream-command python server.py`
 for a subprocess server. HTTP mode uses `--listen 8000 --upstream-url URL` and
-requires `MCPSHIELD_BEARER`. The CLI uses a single static bearer principal with
-the configured scopes and a shared taint context for that principal. Embed
-`http_app` with an issuer-backed bearer verifier for OAuth deployments, and
-configure `HTTPUpstream` with a scoped token provider if the server requires
-credentials. Incoming Authorization headers are never forwarded.
+supports either a static `MCPSHIELD_BEARER` with explicitly configured scopes
+or signed OAuth access tokens via `--oauth-public-key PUBLIC_KEY.pem
+--oauth-issuer ISSUER --oauth-audience RESOURCE`. OAuth mode checks RS256
+signatures, issuer, resource audience, token validity and scope syntax.
+One proxy instance shares a conservative taint context. Run separate
+instances for independent trust domains. Configure `HTTPUpstream` with a
+scoped token provider if the upstream server requires credentials. Incoming Authorization headers are never forwarded.
 The proxy supports newline-delimited stdio and HTTP POST with JSON or SSE
 responses. It implements a restricted tools-only MCP profile.
 

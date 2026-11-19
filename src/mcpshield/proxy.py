@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import sys
 
 import httpx
@@ -186,6 +187,8 @@ class StdioUpstream:
         return cls(await asyncio.create_subprocess_exec(
             *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             limit=MAX_MESSAGE,
+            env={name: value for name, value in os.environ.items()
+                 if not name.startswith("MCPSHIELD_")},
         ))
 
     async def __call__(self, message, scopes):

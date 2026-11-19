@@ -4,10 +4,12 @@ import hmac
 import json
 import os
 import sys
+from pathlib import Path
 
 import uvicorn
 import yaml
 
+from .oauth import JWTBearer
 from .policy import Policy
 from .proxy import HTTPUpstream, Proxy, StdioUpstream, http_app, stdio
 from .sandbox import kubernetes, seccomp
@@ -29,6 +31,9 @@ def main():
     upstream.add_argument("--upstream-command", nargs="+")
     serve.add_argument("--listen", type=int)
     serve.add_argument("--scope", action="append", default=[])
+    serve.add_argument("--oauth-public-key", type=Path)
+    serve.add_argument("--oauth-issuer")
+    serve.add_argument("--oauth-audience")
     args = parser.parse_args()
     if args.command == "gen-seccomp":
         print(yaml.safe_dump_all(kubernetes(*args.kubernetes)) if args.kubernetes else
@@ -43,12 +48,21 @@ def main():
         audit = Audit(sys.stderr)
         scopes = frozenset(args.scope)
         if args.listen is not None:
-            token = os.environ.get("MCPSHIELD_BEARER", "")
-            if not token or not args.upstream_url:
-                parser.error("HTTP mode requires MCPSHIELD_BEARER and --upstream-url")
+            if not args.upstream_url:
+                parser.error("HTTP mode requires --upstream-url")
+            if args.oauth_public_key:
+                if not args.oauth_issuer or not args.oauth_audience:
+                    parser.error("OAuth mode requires --oauth-issuer and --oauth-audience")
+                verify = JWTBearer(
+                    args.oauth_public_key.read_bytes(), args.oauth_issuer, args.oauth_audience
+                )
+            else:
+                token = os.environ.get("MCPSHIELD_BEARER", "")
+                if not token:
+                    parser.error("set MCPSHIELD_BEARER or configure OAuth verification")
 
-            async def verify(value):
-                return scopes if hmac.compare_digest(value.encode(), token.encode()) else None
+                async def verify(value):
+                    return scopes if hmac.compare_digest(value.encode(), token.encode()) else None
 
             proxy = Proxy(policy, HTTPUpstream(args.upstream_url), canaries, audit)
             uvicorn.run(http_app(proxy, verify), host="127.0.0.1", port=args.listen)
