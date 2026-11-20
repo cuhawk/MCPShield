@@ -13,3 +13,4 @@ jobs:
       - run: pip install '.[test]'
       - run: ruff check .
       - run: pytest -q
+      - run: python benchmarks/run_bench.py --iterations 5 --warmup 1

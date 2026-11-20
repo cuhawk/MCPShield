@@ -128,7 +128,7 @@ def test_http_auth_and_sse(policy):
     async def upstream(message, scopes):
         return {"jsonrpc": "2.0", "id": message["id"], "result": {}}
 
-    with TestClient(http_app(Proxy(policy, upstream), verify)) as client:
+    with TestClient(http_app(Proxy(policy, upstream), verify), base_url="http://localhost") as client:
         request = {"jsonrpc": "2.0", "id": 1, "method": "ping"}
         assert client.post("/mcp", json=request).status_code == 401
         reply = client.post("/mcp", json=request, headers={
