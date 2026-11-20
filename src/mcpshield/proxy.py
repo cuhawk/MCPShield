@@ -10,7 +10,7 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
-from .policy import Denied
+from .policy import Denied, PolicyReloader
 from .taint import SessionTaint
 from .telemetry import Audit
 from .transport_guard import (
@@ -56,6 +56,7 @@ class Proxy:
             return error(None, -32600, "Invalid Request")
         notification = "id" not in message
         async with self.lock:
+            policy = self.policy.current if isinstance(self.policy, PolicyReloader) else self.policy
             try:
                 if method not in METHODS:
                     raise Denied("method is not permitted")
@@ -68,7 +69,7 @@ class Proxy:
                     if not isinstance(name, str):
                         raise Denied("tool name is required")
                     arguments = params.get("arguments", {})
-                    rule, attenuated = self.policy.authorize(name, arguments, scopes)
+                    rule, attenuated = policy.authorize(name, arguments, scopes)
                     self.taint.check_call(arguments, rule.tier)
                     params = {"name": name, "arguments": arguments}
                 outbound = {"jsonrpc": "2.0", "method": method, "params": params}
@@ -92,7 +93,7 @@ class Proxy:
                     tools = []
                     for tool in result.get("tools", []):
                         try:
-                            self.policy.authorize(
+                            policy.authorize(
                                 tool["name"], {}, scopes
                             )
                         except Denied as exc:
@@ -113,10 +114,16 @@ class Proxy:
 
 
 class HTTPUpstream:
-    def __init__(self, url, token_for_scopes=None, *, max_response_bytes=MAX_MESSAGE):
+    def __init__(self, url, token_for_scopes=None, *, max_response_bytes=MAX_MESSAGE, mtls=None):
         if type(max_response_bytes) is not int or max_response_bytes < 1:
             raise ValueError("max_response_bytes must be a positive integer")
         self.url = url
+        self.tls_context = None
+        if mtls is not None:
+            parsed = httpx.URL(url)
+            if parsed.scheme != "https" or not parsed.host or parsed.userinfo:
+                raise ValueError("mTLS requires an HTTPS upstream URL without userinfo")
+            self.tls_context = mtls.create_context()
         self.token_for_scopes = token_for_scopes
         self.max_response_bytes = max_response_bytes
         self.negotiated_version = None
@@ -135,7 +142,8 @@ class HTTPUpstream:
                 headers[PROTOCOL_HEADER] = validate_version(version)
         if self.token_for_scopes is not None:
             headers["Authorization"] = f"Bearer {await self.token_for_scopes(scopes)}"
-        async with httpx.AsyncClient(trust_env=False) as client:
+        tls = {} if self.tls_context is None else {"verify": self.tls_context}
+        async with httpx.AsyncClient(trust_env=False, **tls) as client:
             request = client.build_request("POST", self.url, json=message, headers=headers)
             for hop in range(client.max_redirects + 1):
                 reply = await client.send(request, stream=True, follow_redirects=False)
@@ -147,6 +155,10 @@ class HTTPUpstream:
                         raise UpstreamError
                     following = reply.next_request
                     guard_redirect(request, following)
+                    if self.tls_context is not None and (
+                        request.url.host, request.url.port
+                    ) != (following.url.host, following.url.port):
+                        raise TransportViolation("mTLS upstream redirect must stay on the same origin")
                     request = following
                 finally:
                     await reply.aclose()
@@ -187,8 +199,8 @@ class HTTPUpstream:
         return json.loads(body)
 
 
-def http_app(proxy, verify_bearer, *, guard=None):
-    app = FastAPI()
+def http_app(proxy, verify_bearer, *, guard=None, lifespan=None):
+    app = FastAPI(lifespan=lifespan)
     guard = guard if guard is not None else TransportGuard()
 
     @app.api_route("/mcp", methods=["POST", "GET", "DELETE"])

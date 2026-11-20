@@ -2,15 +2,18 @@ import argparse
 import asyncio
 import hmac
 import json
+import math
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import uvicorn
 import yaml
 
+from .mtls_verifier import MTLSConfig
 from .oauth import JWTBearer
-from .policy import Policy
+from .policy import Policy, PolicyReloader
 from .proxy import HTTPUpstream, Proxy, StdioUpstream, http_app, stdio
 from .sandbox import kubernetes, seccomp
 from .telemetry import Audit
@@ -31,6 +34,12 @@ def main():
     upstream.add_argument("--upstream-url")
     upstream.add_argument("--upstream-command", nargs="+")
     serve.add_argument("--listen", type=int)
+    serve.add_argument("--upstream-ca")
+    serve.add_argument("--upstream-cert")
+    serve.add_argument("--upstream-key")
+    serve.add_argument("--upstream-spiffe-id", action="append")
+    serve.add_argument("--policy-reload-interval", type=float, default=1.0,
+                       help="Seconds between policy file checks")
     serve.add_argument("--allow-host", action="append")
     serve.add_argument("--allow-origin", action="append", default=[])
     serve.add_argument("--max-response-bytes", type=int, default=MAX_MESSAGE)
@@ -48,12 +57,34 @@ def main():
     elif args.command == "check":
         Policy.load(args.policy)
     else:
-        policy = Policy.load(args.policy)
+        if not math.isfinite(args.policy_reload_interval) or args.policy_reload_interval <= 0:
+            parser.error("--policy-reload-interval must be finite and positive")
+        policy = PolicyReloader(args.policy)
+
+        @asynccontextmanager
+        async def policy_lifespan(_app):
+            async with policy.watch(args.policy_reload_interval):
+                yield
+
+        mtls = None
+        ssl_options = (args.upstream_ca, args.upstream_cert, args.upstream_key,
+                       args.upstream_spiffe_id)
+        if any(value is not None for value in ssl_options):
+            if not args.upstream_url or not all(ssl_options):
+                parser.error("mTLS requires --upstream-url, --upstream-ca, --upstream-cert, "
+                             "--upstream-key and --upstream-spiffe-id")
+            mtls = MTLSConfig(*ssl_options[:3], tuple(args.upstream_spiffe_id))
         canaries = os.environ.get("MCPSHIELD_CANARIES", "").split()
         audit = Audit(sys.stderr)
         scopes = frozenset(args.scope)
         if args.max_response_bytes < 1:
             parser.error("--max-response-bytes must be positive")
+        if args.upstream_url:
+            try:
+                transport = HTTPUpstream(args.upstream_url,
+                                         max_response_bytes=args.max_response_bytes, mtls=mtls)
+            except (OSError, ValueError) as exc:
+                parser.error(str(exc))
         if args.listen is not None:
             if not args.upstream_url:
                 parser.error("HTTP mode requires --upstream-url")
@@ -81,21 +112,19 @@ def main():
                 )
             except ValueError as exc:
                 parser.error(str(exc))
-            transport = HTTPUpstream(args.upstream_url, max_response_bytes=args.max_response_bytes)
             proxy = Proxy(policy, transport, canaries, audit)
-            uvicorn.run(http_app(proxy, verify, guard=guard), host="127.0.0.1", port=args.listen)
+            uvicorn.run(http_app(proxy, verify, guard=guard, lifespan=policy_lifespan),
+                        host="127.0.0.1", port=args.listen)
         else:
             async def run():
-                if args.upstream_url:
-                    transport = HTTPUpstream(
-                        args.upstream_url, max_response_bytes=args.max_response_bytes
-                    )
-                    await stdio(Proxy(policy, transport, canaries, audit), scopes)
-                else:
-                    transport = await StdioUpstream.spawn(args.upstream_command)
-                    try:
+                async with policy.watch(args.policy_reload_interval):
+                    if args.upstream_url:
                         await stdio(Proxy(policy, transport, canaries, audit), scopes)
-                    finally:
-                        await transport.close()
+                    else:
+                        stdio_upstream = await StdioUpstream.spawn(args.upstream_command)
+                        try:
+                            await stdio(Proxy(policy, stdio_upstream, canaries, audit), scopes)
+                        finally:
+                            await stdio_upstream.close()
 
             asyncio.run(run())
