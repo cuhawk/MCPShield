@@ -5,22 +5,34 @@ Sequential in-process ASGI requests with a stub upstream. Timing includes reques
 
 | Case | Requests | Intercepted | Rate | p50 (ms) | p95 (ms) | p99 (ms) |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Allowed read | 1000 | 0 | 0.0% | 0.301 | 0.423 | 0.533 |
-| Allowed write | 1000 | 0 | 0.0% | 0.302 | 0.449 | 0.525 |
-| Guard / Origin | 1000 | 1000 | 100.0% | 0.222 | 0.322 | 0.380 |
-| Guard / version | 1000 | 1000 | 100.0% | 0.216 | 0.374 | 0.457 |
-| Policy / tool | 1000 | 1000 | 100.0% | 0.238 | 0.331 | 0.399 |
-| Taint / canary | 1000 | 1000 | 100.0% | 0.271 | 0.426 | 0.502 |
-| All compliant | 2000 | 0 | 0.0% | 0.302 | 0.438 | 0.533 |
-| All non-compliant | 4000 | 4000 | 100.0% | 0.241 | 0.368 | 0.473 |
+| Allowed read | 1000 | 0 | 0.0% | 0.310 | 0.460 | 0.648 |
+| Allowed write | 1000 | 0 | 0.0% | 0.312 | 0.523 | 0.714 |
+| Guard / Origin | 1000 | 1000 | 100.0% | 0.233 | 0.354 | 0.495 |
+| Guard / version | 1000 | 1000 | 100.0% | 0.229 | 0.403 | 0.557 |
+| Policy / tool | 1000 | 1000 | 100.0% | 0.251 | 0.407 | 0.559 |
+| Taint / canary | 1000 | 1000 | 100.0% | 0.287 | 0.471 | 0.602 |
+| All compliant | 2000 | 0 | 0.0% | 0.311 | 0.486 | 0.656 |
+| All non-compliant | 4000 | 4000 | 100.0% | 0.252 | 0.425 | 0.559 |
 
 Reload timing covers reading, parsing, schema validation and publication. File writes and watcher polling are outside the timed interval.
 Peer timing covers DER decoding, SVID checks and the SPIFFE allowlist lookup after TLS chain validation. The TLS handshake is outside the timed interval.
 
 | Operation | Samples | p50 (ms) | p95 (ms) | p99 (ms) |
 | --- | ---: | ---: | ---: | ---: |
-| YAML reload | 1000 | 0.252 | 0.322 | 0.397 |
-| JSON reload | 1000 | 0.229 | 0.311 | 0.411 |
-| Peer verification | 1000 | 0.038 | 0.059 | 0.097 |
+| YAML reload | 1000 | 0.274 | 0.375 | 0.517 |
+| JSON reload | 1000 | 0.249 | 0.338 | 0.481 |
+| Peer verification | 1000 | 0.041 | 0.063 | 0.079 |
 
-`pytest -q`: `109 passed, 1 warning in 0.74s`
+## Wave 5 tool pruning and sandbox execution
+
+Six labelled synthetic queries against 60 tools with k=5. Schema tokens are estimated from compact JSON word, number and punctuation counts.
+
+| Metric | Result |
+| --- | ---: |
+| Estimated schema token reduction | 91.6% |
+| Recall@5 | 100.0% (12/12) |
+| Sandbox launch overhead p50 | 2.525 ms |
+| Sandbox launch overhead p95 | 3.595 ms |
+| Sandbox launch overhead p99 | 5.697 ms |
+
+Overhead is the paired wall-clock difference between sandboxed and direct runs of /usr/bin/true, including sandbox setup and teardown.
