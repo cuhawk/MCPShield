@@ -14,6 +14,7 @@ from .policy import Policy
 from .proxy import HTTPUpstream, Proxy, StdioUpstream, http_app, stdio
 from .sandbox import kubernetes, seccomp
 from .telemetry import Audit
+from .transport_guard import LOOPBACK_HOSTS, MAX_MESSAGE, TransportGuard
 
 
 def main():
@@ -30,6 +31,10 @@ def main():
     upstream.add_argument("--upstream-url")
     upstream.add_argument("--upstream-command", nargs="+")
     serve.add_argument("--listen", type=int)
+    serve.add_argument("--allow-host", action="append")
+    serve.add_argument("--allow-origin", action="append", default=[])
+    serve.add_argument("--max-response-bytes", type=int, default=MAX_MESSAGE)
+    serve.add_argument("--max-batch-size", type=int, default=16)
     serve.add_argument("--scope", action="append", default=[])
     serve.add_argument("--oauth-public-key", type=Path)
     serve.add_argument("--oauth-issuer")
@@ -47,6 +52,8 @@ def main():
         canaries = os.environ.get("MCPSHIELD_CANARIES", "").split()
         audit = Audit(sys.stderr)
         scopes = frozenset(args.scope)
+        if args.max_response_bytes < 1:
+            parser.error("--max-response-bytes must be positive")
         if args.listen is not None:
             if not args.upstream_url:
                 parser.error("HTTP mode requires --upstream-url")
@@ -64,13 +71,26 @@ def main():
                 async def verify(value):
                     return scopes if hmac.compare_digest(value.encode(), token.encode()) else None
 
-            proxy = Proxy(policy, HTTPUpstream(args.upstream_url), canaries, audit)
-            uvicorn.run(http_app(proxy, verify), host="127.0.0.1", port=args.listen)
+            try:
+                guard = TransportGuard(
+                    allowed_hosts=args.allow_host or tuple(
+                        f"{host}:{args.listen}" for host in LOOPBACK_HOSTS
+                    ),
+                    allowed_origins=args.allow_origin,
+                    max_batch_size=args.max_batch_size,
+                )
+            except ValueError as exc:
+                parser.error(str(exc))
+            transport = HTTPUpstream(args.upstream_url, max_response_bytes=args.max_response_bytes)
+            proxy = Proxy(policy, transport, canaries, audit)
+            uvicorn.run(http_app(proxy, verify, guard=guard), host="127.0.0.1", port=args.listen)
         else:
             async def run():
                 if args.upstream_url:
-                    await stdio(Proxy(policy, HTTPUpstream(args.upstream_url),
-                                      canaries, audit), scopes)
+                    transport = HTTPUpstream(
+                        args.upstream_url, max_response_bytes=args.max_response_bytes
+                    )
+                    await stdio(Proxy(policy, transport, canaries, audit), scopes)
                 else:
                     transport = await StdioUpstream.spawn(args.upstream_command)
                     try:

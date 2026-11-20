@@ -13,8 +13,16 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from .policy import Denied
 from .taint import SessionTaint
 from .telemetry import Audit
+from .transport_guard import (
+    MAX_MESSAGE,
+    PROTOCOL_HEADER,
+    TransportGuard,
+    TransportViolation,
+    bounded_chunks,
+    guard_redirect,
+    validate_version,
+)
 
-MAX_MESSAGE = 1024 * 1024
 SSE_BOUNDARY = re.compile(rb"(?:\r\n|\n)(?:\r\n|\n)")
 METHODS = {"initialize", "notifications/initialized", "ping", "tools/list", "tools/call"}
 
@@ -36,7 +44,7 @@ class Proxy:
         self.audit = audit or Audit()
         self.lock = asyncio.Lock()
 
-    async def handle(self, message, scopes=frozenset()):
+    async def handle(self, message, scopes=frozenset(), *, protocol_version=None):
         if not isinstance(message, dict):
             return error(None, -32600, "Invalid Request")
         request_id = message.get("id")
@@ -67,7 +75,11 @@ class Proxy:
                 if not notification:
                     outbound["id"] = request_id
                 self.taint.check_canaries(outbound)
-                reply = await asyncio.wait_for(self.upstream(outbound, attenuated), 30)
+                if isinstance(self.upstream, HTTPUpstream):
+                    call = self.upstream(outbound, attenuated, protocol_version=protocol_version)
+                else:
+                    call = self.upstream(outbound, attenuated)
+                reply = await asyncio.wait_for(call, 30)
                 if notification:
                     return None
                 if (not isinstance(reply, dict) or reply.get("jsonrpc") != "2.0"
@@ -94,65 +106,132 @@ class Proxy:
             except Denied as exc:
                 self.audit.record("denied")
                 return None if notification else error(request_id, -32001, str(exc))
-            except (ValueError, KeyError, TypeError, OSError, TimeoutError,
+            except (ValueError, KeyError, TypeError, OSError, TimeoutError, RecursionError,
                     httpx.HTTPError, UpstreamError):
                 self.audit.record("upstream_error")
                 return None if notification else error(request_id, -32002, "Upstream failure")
 
 
 class HTTPUpstream:
-    def __init__(self, url, token_for_scopes=None):
+    def __init__(self, url, token_for_scopes=None, *, max_response_bytes=MAX_MESSAGE):
+        if type(max_response_bytes) is not int or max_response_bytes < 1:
+            raise ValueError("max_response_bytes must be a positive integer")
         self.url = url
         self.token_for_scopes = token_for_scopes
+        self.max_response_bytes = max_response_bytes
+        self.negotiated_version = None
 
-    async def __call__(self, message, scopes):
-        headers = {"Accept": "application/json, text/event-stream"}
+    async def __call__(self, message, scopes, *, protocol_version=None):
+        initializing = message["method"] == "initialize"
+        headers = {"Accept": "application/json, text/event-stream", "Accept-Encoding": "identity"}
+        if initializing:
+            validate_version(message["params"].get("protocolVersion"))
+        else:
+            if (protocol_version is not None and self.negotiated_version is not None
+                    and protocol_version != self.negotiated_version):
+                raise TransportViolation("MCP protocol version differs from negotiated version")
+            version = protocol_version or self.negotiated_version
+            if version is not None:
+                headers[PROTOCOL_HEADER] = validate_version(version)
         if self.token_for_scopes is not None:
             headers["Authorization"] = f"Bearer {await self.token_for_scopes(scopes)}"
         async with httpx.AsyncClient(trust_env=False) as client:
-            async with client.stream("POST", self.url, json=message, headers=headers) as reply:
-                reply.raise_for_status()
-                if reply.status_code == 202:
-                    return None
-                body = bytearray()
-                sse = "text/event-stream" in reply.headers.get("content-type", "")
-                async for chunk in reply.aiter_bytes():
-                    body.extend(chunk)
-                    if len(body) > MAX_MESSAGE:
+            request = client.build_request("POST", self.url, json=message, headers=headers)
+            for hop in range(client.max_redirects + 1):
+                reply = await client.send(request, stream=True, follow_redirects=False)
+                try:
+                    if reply.next_request is None:
+                        result = await self.read_reply(reply, message)
+                        break
+                    if hop == client.max_redirects:
                         raise UpstreamError
-                    while sse and (end := SSE_BOUNDARY.search(body)):
-                        frame = body[:end.start()]
-                        body = body[end.end():]
-                        data = b"\n".join(line[5:].lstrip(b" ") for line in frame.splitlines()
-                                          if line.startswith(b"data:"))
-                        if data:
-                            event = json.loads(data)
-                            if isinstance(event, dict) and event.get("id") == message.get("id"):
-                                return event
-                if sse:
-                    raise UpstreamError
-                return json.loads(body)
+                    following = reply.next_request
+                    guard_redirect(request, following)
+                    request = following
+                finally:
+                    await reply.aclose()
+        if initializing and isinstance(result, dict) and "result" in result:
+            if (result.get("jsonrpc") != "2.0" or "error" in result
+                    or "id" not in message or "id" not in result
+                    or type(result["id"]) is not type(message["id"])
+                    or result["id"] != message["id"] or not isinstance(result["result"], dict)):
+                raise UpstreamError
+            self.negotiated_version = validate_version(result["result"].get("protocolVersion"))
+        return result
+
+    async def read_reply(self, reply, message):
+        reply.raise_for_status()
+        if reply.status_code == 202:
+            return None
+        body = bytearray()
+        sse = reply.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+        sse = sse == "text/event-stream"
+        search_start = 0
+        async for chunk in bounded_chunks(reply, self.max_response_bytes):
+            body.extend(chunk)
+            while sse and (end := SSE_BOUNDARY.search(body, search_start)):
+                frame = body[:end.start()]
+                del body[:end.end()]
+                search_start = 0
+                data = b"\n".join(line[5:].lstrip(b" ") for line in frame.splitlines()
+                                  if line.startswith(b"data:"))
+                if data:
+                    event = json.loads(data)
+                    if (isinstance(event, dict) and "id" in message and "id" in event
+                            and type(event["id"]) is type(message["id"])
+                            and event["id"] == message["id"]):
+                        return event
+            search_start = max(0, len(body) - 3)
+        if sse:
+            raise UpstreamError
+        return json.loads(body)
 
 
-def http_app(proxy, verify_bearer):
+def http_app(proxy, verify_bearer, *, guard=None):
     app = FastAPI()
+    guard = guard if guard is not None else TransportGuard()
 
-    @app.post("/mcp")
+    @app.api_route("/mcp", methods=["POST", "GET", "DELETE"])
     async def serve(request: Request):
+        try:
+            version = guard.validate_headers(
+                request.headers, getattr(proxy.upstream, "negotiated_version", None)
+            )
+        except TransportViolation as exc:
+            return JSONResponse(error(None, -32600, str(exc)), status_code=exc.status)
+        if request.method != "POST":
+            return Response(status_code=405, headers={"Allow": "POST"})
         scheme, _, token = request.headers.get("authorization", "").partition(" ")
         scopes = await verify_bearer(token) if scheme.lower() == "bearer" and token else None
         if scopes is None:
             return Response(status_code=401, headers={"WWW-Authenticate": "Bearer"})
         body = bytearray()
         async for chunk in request.stream():
-            body.extend(chunk)
-            if len(body) > MAX_MESSAGE:
+            if len(chunk) > MAX_MESSAGE - len(body):
                 return Response(status_code=413)
+            body.extend(chunk)
         try:
             message = json.loads(body)
-        except ValueError:
+        except (ValueError, RecursionError):
             return JSONResponse(error(None, -32700, "Parse error"), status_code=400)
-        reply = await proxy.handle(message, frozenset(scopes))
+        try:
+            guard.validate_batch(message, version)
+            entries = message if isinstance(message, list) else [message]
+            for entry in entries:
+                if isinstance(entry, dict) and entry.get("method") == "initialize":
+                    params = entry.get("params")
+                    validate_version(params.get("protocolVersion") if isinstance(params, dict) else None)
+                    if isinstance(message, list):
+                        raise TransportViolation("Initialize must be a standalone request")
+        except TransportViolation as exc:
+            return JSONResponse(error(None, -32600, str(exc)), status_code=exc.status)
+        scopes = frozenset(scopes)
+        if isinstance(message, list):
+            replies = [await proxy.handle(entry, scopes, protocol_version=version)
+                       for entry in message]
+            reply = [item for item in replies if item is not None] or None
+        else:
+            reply = await proxy.handle(message, scopes, protocol_version=version)
         if reply is None:
             return Response(status_code=202)
         if "text/event-stream" in request.headers.get("accept", ""):
