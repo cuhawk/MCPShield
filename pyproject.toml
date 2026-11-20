@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "mcpshield"
 version = "0.1.0"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2", "httpx", "pyyaml", "opentelemetry-api", "fastapi", "uvicorn", "jsonschema", "PyJWT[crypto]>=2.10"]
+dependencies = ["pydantic>=2", "httpx", "pyyaml", "opentelemetry-api", "fastapi", "uvicorn", "jsonschema", "PyJWT[crypto]>=2.10", "cryptography"]
 
 [project.optional-dependencies]
 test = ["pytest", "ruff"]

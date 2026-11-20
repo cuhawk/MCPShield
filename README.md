@@ -44,6 +44,15 @@ scoped token provider if the upstream server requires credentials. Incoming Auth
 The proxy supports newline-delimited stdio and HTTP POST with JSON or SSE
 responses. It implements a restricted tools-only MCP profile.
 
+### Policy hot reload
+
+Both proxy modes poll the YAML or JSON policy file every second by default.
+Set the interval with `--policy-reload-interval SECONDS`. Publish changes by
+writing a complete file and atomically renaming it over the policy path.
+The proxy validates the replacement before publishing it. Invalid updates
+leave the active policy in place and emit a diagnostic on stderr.
+In-flight requests finish using the policy they started with.
+
 ### Streamable HTTP security
 
 The listener accepts loopback Host authorities on the configured port by
@@ -58,6 +67,21 @@ The proxy supports MCP protocol versions `2025-03-26`, `2025-06-18` and
 headers against the upstream selection. Before negotiation, requests without
 a version header use `2025-03-26`. Only that legacy version accepts JSON-RPC
 batches, with up to 16 entries by default (`--max-batch-size`).
+
+To authenticate an HTTPS upstream by SPIFFE identity, provide the trust
+bundle and client certificate chain and key. Repeat `--upstream-spiffe-id`
+for each exact allowed workload ID.
+
+```sh
+mcpshield proxy policy.yml --listen 8000 --upstream-url https://mcp.example.org/mcp \
+  --upstream-ca trust-bundle.pem --upstream-cert client-chain.pem \
+  --upstream-key client-key.pem --upstream-spiffe-id spiffe://example.org/mcp
+```
+
+The upstream must require and validate the client certificate. The proxy
+validates the upstream chain against the supplied bundle, then verifies its
+SPIFFE URI SAN as the server identity before sending any MCP request.
+In mTLS mode, upstream redirects must stay on the same origin.
 
 Upstream redirects strip Authorization, Cookie and X-API-Key on any origin
 change. HTTPS-to-HTTP redirects are rejected. Upstream response reads use
@@ -77,12 +101,20 @@ a restricted namespace, gVisor pod and deny-all network policy with
 against the actual upstream runtime and configure permitted network flows
 before deploying network-dependent servers.
 
-## Interception benchmark
+## Tests and benchmarks
 
-Run `python benchmarks/run_bench.py` after installing the package. The fixed
-workload sends requests through the HTTP, policy and taint pipeline in process
-using a stub upstream. The recorded Python 3.12.14 run intercepted all 4,000
-non-compliant requests and allowed all 2,000 compliant requests. Observed
-p50/p95/p99 latency was 0.269/0.477/0.666 ms for non-compliant requests and
-0.332/0.576/0.731 ms for compliant requests.
+Run `pytest -q` and `python benchmarks/run_bench.py` after installing the
+package with its test dependencies. The Python 3.12.14 run intercepted all
+4,000 non-compliant requests and allowed all 2,000 compliant requests.
+
+`pytest -q` reported `109 passed, 1 warning in 0.74s`.
+
+| Operation | p50 (ms) | p95 (ms) | p99 (ms) |
+| --- | ---: | ---: | ---: |
+| YAML reload | 0.252 | 0.322 | 0.397 |
+| JSON reload | 0.229 | 0.311 | 0.411 |
+| Peer verification | 0.038 | 0.059 | 0.097 |
+
+Reload measurements cover file reads, validation and publication. Peer
+verification measures the SVID check after TLS chain validation.
 [Full benchmark results](benchmarks/RESULTS.md)

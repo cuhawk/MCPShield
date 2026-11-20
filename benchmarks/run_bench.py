@@ -2,13 +2,21 @@
 
 import argparse
 import asyncio
+from datetime import UTC, datetime, timedelta
 from math import ceil
+from pathlib import Path
 from platform import machine, python_version
+from tempfile import TemporaryDirectory
 from time import perf_counter_ns
 
 import httpx
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
-from mcpshield.policy import Policy
+from mcpshield.mtls_verifier import PeerVerifier
+from mcpshield.policy import Policy, PolicyReloader
 from mcpshield.proxy import Proxy, http_app
 from mcpshield.transport_guard import PROTOCOL_HEADER, TransportGuard
 
@@ -78,7 +86,7 @@ async def run(iterations, warmup):
     print("# MCPShield benchmark results")
     print()
     print(f"Python {python_version()} on {machine()}. "
-          f"{iterations} measured requests and {warmup} warm-up requests per case.")
+          f"Measured iterations per case: {iterations}. Warm-up iterations per case: {warmup}.")
     print("Sequential in-process ASGI requests with a stub upstream. "
           "Timing includes request encoding, authentication, interception and response handling.")
     print()
@@ -90,6 +98,77 @@ async def run(iterations, warmup):
         indices = [i for i, case in enumerate(CASES) if (case[-1] is not None) == noncompliant]
         print_row(name, [sample for i in indices for sample in samples[i]],
                   sum(intercepted[i] for i in indices))
+
+
+    await benchmark_reload_and_peer(iterations, warmup)
+
+
+def benchmark_certificate(identity):
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "benchmark")])
+    now = datetime.now(UTC)
+    return (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now)
+        .not_valid_after(now + timedelta(days=1))
+        .add_extension(x509.SubjectAlternativeName([x509.UniformResourceIdentifier(identity)]),
+                       critical=False)
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.KeyUsage(
+            digital_signature=True, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=False, crl_sign=False,
+            encipher_only=False, decipher_only=False,
+        ), critical=True)
+        .sign(key, hashes.SHA256())
+        .public_bytes(serialization.Encoding.DER)
+    )
+
+
+async def benchmark_reload_and_peer(iterations, warmup):
+    contents = {"YAML": "tools: {read: {}}", "JSON": '{"tools": {"other": {}}}'}
+    reload_samples = {f"{name} reload": [] for name in contents}
+    peer_samples = []
+    identity = "spiffe://example.org/benchmark"
+    peer = PeerVerifier((identity,))
+    certificate = benchmark_certificate(identity)
+    with TemporaryDirectory() as folder:
+        path = Path(folder) / "policy"
+        path.write_text("tools: {}")
+        policies = PolicyReloader(path)
+        for index in range(iterations + warmup):
+            for name, content in contents.items():
+                path.write_text(content)
+                start = perf_counter_ns()
+                reloaded = await policies.reload()
+                elapsed = perf_counter_ns() - start
+                if not reloaded:
+                    raise RuntimeError(f"{name} policy was not published")
+                if index >= warmup:
+                    reload_samples[f"{name} reload"].append(elapsed)
+
+            start = perf_counter_ns()
+            verified = peer.verify(certificate)
+            elapsed = perf_counter_ns() - start
+            if verified != identity:
+                raise RuntimeError("Unexpected verified peer identity")
+            if index >= warmup:
+                peer_samples.append(elapsed)
+
+    print()
+    print("Reload timing covers reading, parsing, schema validation and publication. "
+          "File writes and watcher polling are outside the timed interval.")
+    print("Peer timing covers DER decoding, SVID checks and the SPIFFE allowlist lookup "
+          "after TLS chain validation. The TLS handshake is outside the timed interval.")
+    print()
+    print("| Operation | Samples | p50 (ms) | p95 (ms) | p99 (ms) |")
+    print("| --- | ---: | ---: | ---: | ---: |")
+    for name, durations in (reload_samples | {"Peer verification": peer_samples}).items():
+        measurements = " | ".join(f"{percentile(durations, p):.3f}" for p in (50, 95, 99))
+        print(f"| {name} | {len(durations)} | {measurements} |")
 
 
 def print_row(name, samples, intercepted):
