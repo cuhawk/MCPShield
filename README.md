@@ -101,20 +101,54 @@ a restricted namespace, gVisor pod and deny-all network policy with
 against the actual upstream runtime and configure permitted network flows
 before deploying network-dependent servers.
 
+## Wave 5 tool execution and catalog pruning
+
+`SandboxRunner` is a one-shot API for Linux with Bubblewrap and user-namespace
+support. It accepts an argument vector for a system executable under
+`/usr/bin`, starts it with a fresh environment and a private 16 MiB `/work`
+filesystem, and returns the exit status, capped stdout and stderr, and
+timeout and truncation flags. System binaries and libraries are read-only.
+Each launch gets a private network namespace and has no direct egress.
+When validating destinations for a trusted broker, pass `allowed_hosts` to
+the runner and declare `outbound_urls` on each invocation. The broker must
+validate each redirect destination before following it.
+
+```python
+from mcpshield.sandbox_runner import SandboxRunner
+from mcpshield.tool_pruner import ToolPruner
+
+result = SandboxRunner(timeout=2).run(("/usr/bin/printf", "%s", "hello"))
+assert result.stdout == b"hello"
+
+# Build the index from tools/list after applying policy and scope filtering.
+pruner = ToolPruner(authorized_tools)
+selected = pruner.select("list upcoming calendar events", k=5)
+```
+
+The pruner indexes names, descriptions and input schema metadata. It ranks
+each query using BM25 and a boost for matching `x-tags` in the input schema,
+with ties broken by tool name. Continue enforcing tool policy on each call.
+
 ## Tests and benchmarks
 
-Run `pytest -q` and `python benchmarks/run_bench.py` after installing the
-package with its test dependencies. The Python 3.12.14 run intercepted all
-4,000 non-compliant requests and allowed all 2,000 compliant requests.
+On Linux, install Bubblewrap (for example, `sudo apt-get install bubblewrap`
+on Ubuntu) and the Python test dependencies with `pip install -e '.[test]'`.
+Run `ruff check .`, `pytest -q` and `python benchmarks/run_bench.py`.
+The Python 3.12.14 run intercepted all 4,000 non-compliant requests and
+allowed all 2,000 compliant requests. The test suite passed 128 tests,
+including defensive regression checks mapped to ASI01–ASI10.
 
-`pytest -q` reported `109 passed, 1 warning in 0.74s`.
+The Wave 5 benchmark uses six labelled synthetic queries over 60 tools
+and a top-five selection. It estimates schema tokens from compact JSON
+and measures sandbox launch overhead against paired direct runs of
+`/usr/bin/true`.
 
-| Operation | p50 (ms) | p95 (ms) | p99 (ms) |
-| --- | ---: | ---: | ---: |
-| YAML reload | 0.252 | 0.322 | 0.397 |
-| JSON reload | 0.229 | 0.311 | 0.411 |
-| Peer verification | 0.038 | 0.059 | 0.097 |
+| Metric | Result |
+| --- | ---: |
+| Estimated schema token reduction | 91.6% |
+| Recall@5 | 100.0% (12/12) |
+| Sandbox launch overhead p50 | 2.525 ms |
+| Sandbox launch overhead p95 | 3.595 ms |
+| Sandbox launch overhead p99 | 5.697 ms |
 
-Reload measurements cover file reads, validation and publication. Peer
-verification measures the SVID check after TLS chain validation.
 [Full benchmark results](benchmarks/RESULTS.md)

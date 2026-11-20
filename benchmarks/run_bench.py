@@ -1,7 +1,10 @@
-"""Measure the in-process MCPShield HTTP interception pipeline."""
+"""Measure MCPShield interception, tool pruning and sandbox launch overhead."""
 
 import argparse
 import asyncio
+import json
+import re
+import subprocess
 from datetime import UTC, datetime, timedelta
 from math import ceil
 from pathlib import Path
@@ -18,6 +21,8 @@ from cryptography.x509.oid import NameOID
 from mcpshield.mtls_verifier import PeerVerifier
 from mcpshield.policy import Policy, PolicyReloader
 from mcpshield.proxy import Proxy, http_app
+from mcpshield.sandbox_runner import SandboxRunner
+from mcpshield.tool_pruner import ToolPruner
 from mcpshield.transport_guard import PROTOCOL_HEADER, TransportGuard
 
 TOKEN = "benchmark"
@@ -101,6 +106,7 @@ async def run(iterations, warmup):
 
 
     await benchmark_reload_and_peer(iterations, warmup)
+    benchmark_wave5(iterations, warmup)
 
 
 def benchmark_certificate(identity):
@@ -169,6 +175,89 @@ async def benchmark_reload_and_peer(iterations, warmup):
     for name, durations in (reload_samples | {"Peer verification": peer_samples}).items():
         measurements = " | ".join(f"{percentile(durations, p):.3f}" for p in (50, 95, 99))
         print(f"| {name} | {len(durations)} | {measurements} |")
+
+
+def schema_token_estimate(tools):
+    wire = json.dumps(tools, separators=(",", ":"), sort_keys=True)
+    return len(re.findall(r"[A-Za-z]+|[0-9]+|[^\w\s]", wire))
+
+
+def benchmark_wave5(iterations, warmup):
+    domains = {
+        "calendar": ("schedule upcoming appointments and add a meeting", ("list", "create")),
+        "billing": ("retrieve an invoice and list outstanding charges", ("get", "list")),
+        "warehouse": ("track a pallet and count remaining stock", ("get", "count")),
+        "identity": ("disable an account and inspect its profile", ("disable", "get")),
+        "mail": ("deliver a message and find matching correspondence", ("send", "search")),
+        "reports": ("download a report and enumerate report archives", ("export", "list")),
+    }
+    descriptions = {
+        "list": "enumerate upcoming outstanding archives",
+        "create": "add a meeting",
+        "get": "retrieve an invoice or inspect a profile or track a pallet",
+        "count": "count remaining stock",
+        "disable": "disable an account",
+        "send": "deliver a message",
+        "search": "find matching correspondence",
+        "export": "download a report",
+        "archive": "move an item to cold storage",
+        "edit": "update an existing item",
+    }
+    tools = [
+        {
+            "name": f"{domain}_{action}",
+            "description": f"{action} {domain} records. {description}.",
+            "inputSchema": {
+                "type": "object", "x-tags": [domain],
+                "properties": {"reference": {"type": "string", "description": "Record identifier"}},
+            },
+        }
+        for domain in domains for action, description in descriptions.items()
+    ]
+    k = 5
+    total_tokens = schema_token_estimate(tools) * len(domains)
+    selected_tokens = hits = relevant = 0
+    pruner = ToolPruner(tools)
+    for domain, (query, expected) in domains.items():
+        selected = pruner.select(f"{domain}: {query}", k)
+        selected_tokens += schema_token_estimate(selected)
+        hits += len({tool["name"] for tool in selected} & {
+            f"{domain}_{action}" for action in expected
+        })
+        relevant += len(expected)
+
+    command = ("/usr/bin/true",)
+    runner = SandboxRunner()
+    overhead_samples = []
+    for index in range(warmup + iterations):
+        start = perf_counter_ns()
+        subprocess.run(command, check=True, stdin=subprocess.DEVNULL, capture_output=True)
+        baseline = perf_counter_ns() - start
+        start = perf_counter_ns()
+        result = runner.run(command)
+        overhead = perf_counter_ns() - start - baseline
+        if result.returncode or result.timed_out:
+            raise RuntimeError(f"Sandbox launch failed: {result.stderr.decode(errors='replace')}")
+        if index >= warmup:
+            overhead_samples.append(overhead)
+
+    print()
+    print("## Wave 5 tool pruning and sandbox execution")
+    print()
+    print(f"Six labelled synthetic queries against {len(tools)} tools with k={k}. "
+          "Schema tokens are estimated from compact JSON word, number and punctuation counts.")
+    print()
+    print("| Metric | Result |")
+    print("| --- | ---: |")
+    print(f"| Estimated schema token reduction | {1 - selected_tokens / total_tokens:.1%} |")
+    print(f"| Recall@{k} | {hits / relevant:.1%} ({hits}/{relevant}) |")
+    for percent in (50, 95, 99):
+        print(f"| Sandbox launch overhead p{percent} | "
+              f"{percentile(overhead_samples, percent):.3f} ms |")
+    print()
+    print("Overhead is the paired wall-clock difference between sandboxed and direct "
+          "runs of /usr/bin/true, including sandbox setup and teardown.")
+
 
 
 def print_row(name, samples, intercepted):
