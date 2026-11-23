@@ -2,6 +2,8 @@
 
 **Zero-Trust Security Firewall & Capability Proxy for Model Context Protocol (MCP) & Autonomous AI Agents.**
 
+[![M8ven Score](https://m8ven.ai/badge/mcp/cuhawk-mcpshield-ede87e?v=3fd19d502c20b872ca98e8a7ad92f7f4)](https://m8ven.ai/mcp/cuhawk-mcpshield-ede87e?s=readme)
+
 ## Architecture Targets
 1. **JSON-RPC / HTTP-SSE MCP Proxy (`mcpshield`):** Sits inline between MCP hosts/agents and downstream MCP servers.
 2. **OAuth 2.1 Capability Attenuation:** Validates tool-call scopes, enforces read/write/privileged policy tiers, and strips over-privileged tokens before tool invocation.
